@@ -1,9 +1,10 @@
 package service
 
 import (
-	"github.com/trustwallet/assets-go-libs/pkg/validation"
-	"github.com/trustwallet/assets/internal/file"
+	"github.com/trustwallet/assets-go-libs/file"
+	"github.com/trustwallet/assets-go-libs/validation"
 	"github.com/trustwallet/assets/internal/processor"
+	"github.com/trustwallet/assets/internal/report"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -11,29 +12,40 @@ import (
 type Service struct {
 	fileService      *file.Service
 	processorService *processor.Service
+	reportService    *report.Service
+	paths            []string
 }
 
-func NewService(fs *file.Service, cs *processor.Service) *Service {
+func NewService(fs *file.Service, cs *processor.Service, rs *report.Service, paths []string) *Service {
 	return &Service{
 		fileService:      fs,
 		processorService: cs,
+		reportService:    rs,
+		paths:            paths,
 	}
 }
 
-func (s *Service) RunJob(paths []string, job func(*file.AssetFile)) {
-	for _, path := range paths {
+func (s *Service) RunJob(job func(*file.AssetFile)) {
+	for _, path := range s.paths {
 		f := s.fileService.GetAssetFile(path)
+		s.reportService.IncTotalFiles()
 		job(f)
+	}
+
+	reportMsg := s.reportService.GetReport()
+	if s.reportService.IsFailed() {
+		log.Fatal(reportMsg)
+	} else {
+		log.Info(reportMsg)
 	}
 }
 
 func (s *Service) Check(f *file.AssetFile) {
-	validator := s.processorService.GetValidator(f)
+	validators := s.processorService.GetValidator(f)
 
-	if validator != nil {
+	for _, validator := range validators {
 		if err := validator.Run(f); err != nil {
-			// TODO: somehow return an error from Check if there are any errors.
-			HandleError(err, f, validator.Name)
+			s.handleError(err, f, validator.Name)
 		}
 	}
 }
@@ -43,18 +55,13 @@ func (s *Service) Fix(f *file.AssetFile) {
 
 	for _, fixer := range fixers {
 		if err := fixer.Run(f); err != nil {
-			HandleError(err, f, fixer.Name)
+			s.handleError(err, f, fixer.Name)
 		}
 	}
 }
 
 func (s *Service) RunUpdateAuto() {
 	updaters := s.processorService.GetUpdatersAuto()
-	s.runUpdaters(updaters)
-}
-
-func (s *Service) RunUpdateManual() {
-	updaters := s.processorService.GetUpdatersManual()
 	s.runUpdaters(updaters)
 }
 
@@ -67,23 +74,19 @@ func (s *Service) runUpdaters(updaters []processor.Updater) {
 	}
 }
 
-func HandleError(err error, info *file.AssetFile, valName string) {
+func (s *Service) handleError(err error, info *file.AssetFile, valName string) {
 	errors := UnwrapComposite(err)
 
 	for _, err := range errors {
-		logFields := log.Fields{
+		log.WithFields(log.Fields{
 			"type":       info.Type(),
 			"chain":      info.Chain().Handle,
 			"asset":      info.Asset(),
 			"path":       info.Path(),
 			"validation": valName,
-		}
+		}).Error(err)
 
-		if warn, ok := err.(*validation.Warning); ok {
-			log.WithFields(logFields).Warning(warn)
-		} else {
-			log.WithFields(logFields).Error(err)
-		}
+		s.reportService.IncErrors()
 	}
 }
 
